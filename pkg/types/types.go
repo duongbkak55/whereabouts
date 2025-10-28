@@ -72,7 +72,8 @@ type IPAMConfig struct {
 	ConfigurationPath        string           `json:"configuration_path"`
 	PodName                  string
 	PodNamespace             string
-	NetworkName              string `json:"network_name,omitempty"`
+	NetworkName              string `json:"network_name,omitempty"` 
+	StickyByName             bool   `json:"sticky_by_name,omitempty"`
 }
 
 func (ic *IPAMConfig) UnmarshalJSON(data []byte) error {
@@ -110,6 +111,7 @@ func (ic *IPAMConfig) UnmarshalJSON(data []byte) error {
 		PodName                  string
 		PodNamespace             string
 		NetworkName              string `json:"network_name,omitempty"`
+		StickyByName             bool   `json:"sticky_by_name,omitempty"`
 	}
 
 	ipamConfigAlias := IPAMConfigAlias{
@@ -147,6 +149,7 @@ func (ic *IPAMConfig) UnmarshalJSON(data []byte) error {
 		PodName:                  ipamConfigAlias.PodName,
 		PodNamespace:             ipamConfigAlias.PodNamespace,
 		NetworkName:              ipamConfigAlias.NetworkName,
+		StickyByName:             ipamConfigAlias.StickyByName,
 	}
 	return nil
 }
@@ -194,6 +197,9 @@ type IPReservation struct {
 	PodRef      string `json:"podref"`
 	IfName      string `json:"ifName"`
 	IsAllocated bool
+	// add active and time for Stick Pool
+	Active    bool      `json:"active,omitempty"`
+	Timestamp time.Time `json:"timestamp,omitempty"`
 }
 
 func (ir IPReservation) String() string {

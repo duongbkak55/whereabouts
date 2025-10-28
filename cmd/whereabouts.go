@@ -23,6 +23,9 @@ func cmdAddFunc(args *skel.CmdArgs) error {
 		logging.Errorf("IPAM configuration load failed: %s", err)
 		return err
 	}
+	if ipamConf.StickyByName {
+		logging.Debugf("Sticky-by-name mode enabled for this pool: %q", ipamConf.NetworkName)
+	}
 	logging.Debugf("ADD - IPAM configuration successfully read: %+v", *ipamConf)
 	ipam, err := kubernetes.NewKubernetesIPAM(args.ContainerID, args.IfName, *ipamConf)
 	if err != nil {

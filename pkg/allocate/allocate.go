@@ -3,10 +3,12 @@ package allocate
 import (
 	"fmt"
 	"net"
+	"time"
 
 	"github.com/k8snetworkplumbingwg/whereabouts/pkg/iphelpers"
 	"github.com/k8snetworkplumbingwg/whereabouts/pkg/logging"
 	"github.com/k8snetworkplumbingwg/whereabouts/pkg/types"
+	whereaboutstypes "github.com/k8snetworkplumbingwg/whereabouts/pkg/types"
 )
 
 // AssignmentError defines an IP assignment error.
@@ -23,22 +25,13 @@ func (a AssignmentError) Error() string {
 }
 
 // AssignIP assigns an IP using a range and a reserve list.
-func AssignIP(ipamConf types.RangeConfiguration, reservelist []types.IPReservation, containerID, podRef, ifName string) (net.IPNet, []types.IPReservation, error) {
+func AssignIP(ipamConf types.RangeConfiguration, reservelist []types.IPReservation, containerID, podRef, ifName string, ipamConfFull whereaboutstypes.IPAMConfig) (net.IPNet, []types.IPReservation, error) {
 
 	// Setup the basics here.
 	_, ipnet, _ := net.ParseCIDR(ipamConf.Range)
-
-	// Verify if podRef and ifName have already an allocation.
-	for i, r := range reservelist {
-		if r.PodRef == podRef && r.IfName == ifName {
-			logging.Debugf("IP already allocated for podRef: %q - ifName:%q - IP: %s", podRef, ifName, r.IP.String())
-			if r.ContainerID != containerID {
-				logging.Debugf("updating container ID: %q", containerID)
-				reservelist[i].ContainerID = containerID
-			}
-
-			return net.IPNet{IP: r.IP, Mask: ipnet.Mask}, reservelist, nil
-		}
+	// if StickByName
+	if ipamConfFull.StickyByName {
+		return AssignForSticky(*ipnet, reservelist, containerID, podRef, ifName)
 	}
 
 	newip, updatedreservelist, err := IterateForAssignment(*ipnet, ipamConf.RangeStart, ipamConf.RangeEnd, reservelist, ipamConf.OmitRanges, containerID, podRef, ifName)
@@ -49,8 +42,70 @@ func AssignIP(ipamConf types.RangeConfiguration, reservelist []types.IPReservati
 	return net.IPNet{IP: newip, Mask: ipnet.Mask}, updatedreservelist, nil
 }
 
+func AssignForSticky(ipnet net.IPNet, reservelist []types.IPReservation, containerID, podRef, ifName string) (net.IPNet, []types.IPReservation, error) {
+	// Verify if podRef and ifName have already an allocation.
+	for i, r := range reservelist {
+		if r.PodRef == podRef && r.IfName == ifName {
+			logging.Debugf("IP already allocated for podRef: %q - ifName:%q - IP: %s", podRef, ifName, r.IP.String())
+			if r.ContainerID != containerID {
+				logging.Debugf("updating container ID: %q", containerID)
+				reservelist[i].ContainerID = containerID
+				reservelist[i].Active = true
+				reservelist[i].Timestamp = time.Now()
+			}
+
+			return net.IPNet{IP: r.IP, Mask: ipnet.Mask}, reservelist, nil
+		}
+	}
+
+	// 2. First priority: reuse entries where PodRef is empty
+	for i, r := range reservelist {
+		if r.PodRef == "" {
+			reservelist[i].Active = true
+			reservelist[i].PodRef = podRef
+			reservelist[i].IfName = ifName
+			reservelist[i].ContainerID = containerID
+			reservelist[i].Timestamp = time.Now()
+			return net.IPNet{IP: r.IP, Mask: ipnet.Mask}, reservelist, nil
+		}
+	}
+
+	// 3. Next: find next available inactive IP
+	for i, r := range reservelist {
+		if !r.Active {
+			reservelist[i].Active = true
+			reservelist[i].PodRef = podRef
+			reservelist[i].IfName = ifName
+			reservelist[i].ContainerID = containerID
+			reservelist[i].Timestamp = time.Now()
+			return net.IPNet{IP: r.IP, Mask: ipnet.Mask}, reservelist, nil
+		}
+	}
+
+	// 4. Pool full → evict oldest non-sticky IP
+	oldestIdx := -1
+	oldestTime := time.Now()
+	for i, r := range reservelist {
+		if r.Timestamp.Before(oldestTime) {
+			oldestTime = r.Timestamp
+			oldestIdx = i
+		}
+	}
+
+	if oldestIdx >= 0 {
+		reservelist[oldestIdx].PodRef = podRef
+		reservelist[oldestIdx].IfName = ifName
+		reservelist[oldestIdx].ContainerID = containerID
+		reservelist[oldestIdx].Active = true
+		reservelist[oldestIdx].Timestamp = time.Now()
+		return net.IPNet{IP: reservelist[oldestIdx].IP, Mask: ipnet.Mask}, reservelist, nil
+	}
+
+	return net.IPNet{}, reservelist, fmt.Errorf("IP pool exhausted for sticky pool")
+}
+
 // DeallocateIP removes allocation from reserve list. Returns the updated reserve list and the deallocated IP.
-func DeallocateIP(reservelist []types.IPReservation, containerID, ifName string) ([]types.IPReservation, net.IP) {
+func DeallocateIP(reservelist []types.IPReservation, containerID, ifName string, sticky bool) ([]types.IPReservation, net.IP) {
 	index := getMatchingIPReservationIndex(reservelist, containerID, ifName)
 	if index < 0 {
 		// Allocation not found. Return the original reserve list and nil IP.
@@ -58,7 +113,18 @@ func DeallocateIP(reservelist []types.IPReservation, containerID, ifName string)
 	}
 
 	ip := reservelist[index].IP
-	logging.Debugf("Deallocating given previously used IP: %v", ip.String())
+	// impl: just update active and timestamp
+	logging.Debugf("Deallocating given previously used IP: %v (sticky=%v)", ip.String(), sticky)
+
+	// Sticky mode: don't remove the allocation now
+	if sticky {
+		// Just mark the allocation as inactive but keep it in list for potential reuse.
+		if len(reservelist) > index {
+			reservelist[index].Active = false
+			reservelist[index].Timestamp = time.Now() // refresh timestamp for GC ordering
+		}
+		return reservelist, nil
+	}
 
 	return removeIdxFromSlice(reservelist, index), ip
 }
