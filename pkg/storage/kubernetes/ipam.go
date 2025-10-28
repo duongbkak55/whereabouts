@@ -633,7 +633,7 @@ func IPManagementKubernetesUpdate(ctx context.Context, mode int, ipam *Kubernete
 			var updatedreservelist []whereaboutstypes.IPReservation
 			switch mode {
 			case whereaboutstypes.Allocate:
-				newip, updatedreservelist, err = allocate.AssignIP(ipRange, reservelist, ipam.ContainerID, ipamConf.GetPodRef(), ipam.IfName)
+				newip, updatedreservelist, err = allocate.AssignIP(ipRange, reservelist, ipam.ContainerID, ipamConf.GetPodRef(), ipam.IfName, ipamConf)
 				if err != nil {
 					logging.Errorf("Error assigning IP: %v", err)
 					return newips, err
