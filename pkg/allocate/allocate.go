@@ -31,9 +31,14 @@ func AssignIP(ipamConf types.RangeConfiguration, reservelist []types.IPReservati
 	_, ipnet, _ := net.ParseCIDR(ipamConf.Range)
 	// if StickByName
 	if ipamConfFull.StickyByName {
-		return AssignForSticky(*ipnet, reservelist, containerID, podRef, ifName)
-	}
+		newip, updatedreservelist, err := IterateForAssignmentBySticky(*ipnet, ipamConf.RangeStart, ipamConf.RangeEnd, reservelist, ipamConf.OmitRanges, containerID, podRef, ifName)
+		if err != nil {
+			return net.IPNet{}, nil, err
+		}
 
+		return net.IPNet{IP: newip, Mask: ipnet.Mask}, updatedreservelist, nil
+	}
+	// original
 	newip, updatedreservelist, err := IterateForAssignment(*ipnet, ipamConf.RangeStart, ipamConf.RangeEnd, reservelist, ipamConf.OmitRanges, containerID, podRef, ifName)
 	if err != nil {
 		return net.IPNet{}, nil, err
@@ -42,66 +47,76 @@ func AssignIP(ipamConf types.RangeConfiguration, reservelist []types.IPReservati
 	return net.IPNet{IP: newip, Mask: ipnet.Mask}, updatedreservelist, nil
 }
 
-func AssignForSticky(ipnet net.IPNet, reservelist []types.IPReservation, containerID, podRef, ifName string) (net.IPNet, []types.IPReservation, error) {
-	// Verify if podRef and ifName have already an allocation.
-	for i, r := range reservelist {
+func IterateForAssignmentBySticky(
+	ipnet net.IPNet,
+	rangeStart, rangeEnd net.IP,
+	reserveList []types.IPReservation,
+	excludeRanges []string,
+	containerID, podRef, ifName string,
+) (net.IP, []types.IPReservation, error) {
+
+	firstIP, lastIP, err := iphelpers.GetIPRange(ipnet, rangeStart, rangeEnd)
+	if err != nil {
+		logging.Errorf("GetIPRange failed: %v", err)
+		return net.IP{}, reserveList, err
+	}
+
+	excluded := []*net.IPNet{}
+	for _, v := range excludeRanges {
+		subnet, err := parseExcludedRange(v)
+		if err != nil {
+			return net.IP{}, reserveList, fmt.Errorf("could not parse exclude range, err: %q", err)
+		}
+		excluded = append(excluded, subnet)
+	}
+
+	// ✅ Step 1: Try to reuse old sticky reservation
+	for i, r := range reserveList {
 		if r.PodRef == podRef && r.IfName == ifName {
-			logging.Debugf("IP already allocated for podRef: %q - ifName:%q - IP: %s", podRef, ifName, r.IP.String())
-			if r.ContainerID != containerID {
-				logging.Debugf("updating container ID: %q", containerID)
-				reservelist[i].ContainerID = containerID
-				reservelist[i].Active = true
-				reservelist[i].Timestamp = time.Now()
+			logging.Debugf("Sticky reuse for podRef=%q, IP=%s", podRef, r.IP)
+			reserveList[i].Active = true
+			reserveList[i].ContainerID = containerID
+			reserveList[i].Timestamp = time.Now()
+			return r.IP, reserveList, nil
+		}
+	}
+
+	// ✅ Step 2: Try to allocate from inactive entries within valid range
+	for i, r := range reserveList {
+		if !r.Active && ipnet.Contains(r.IP) && iphelpers.CompareIPs(r.IP, firstIP) >= 0 && iphelpers.CompareIPs(r.IP, lastIP) <= 0 {
+			if skipTo := skipExcludedSubnets(r.IP, excluded); skipTo != nil {
+				continue // skip excluded IPs
 			}
-
-			return net.IPNet{IP: r.IP, Mask: ipnet.Mask}, reservelist, nil
+			reserveList[i].Active = true
+			reserveList[i].PodRef = podRef
+			reserveList[i].IfName = ifName
+			reserveList[i].ContainerID = containerID
+			reserveList[i].Timestamp = time.Now()
+			return r.IP, reserveList, nil
 		}
 	}
 
-	// 2. First priority: reuse entries where PodRef is empty
-	for i, r := range reservelist {
-		if r.PodRef == "" {
-			reservelist[i].Active = true
-			reservelist[i].PodRef = podRef
-			reservelist[i].IfName = ifName
-			reservelist[i].ContainerID = containerID
-			reservelist[i].Timestamp = time.Now()
-			return net.IPNet{IP: r.IP, Mask: ipnet.Mask}, reservelist, nil
-		}
-	}
-
-	// 3. Next: find next available inactive IP
-	for i, r := range reservelist {
-		if !r.Active {
-			reservelist[i].Active = true
-			reservelist[i].PodRef = podRef
-			reservelist[i].IfName = ifName
-			reservelist[i].ContainerID = containerID
-			reservelist[i].Timestamp = time.Now()
-			return net.IPNet{IP: r.IP, Mask: ipnet.Mask}, reservelist, nil
-		}
-	}
-
-	// 4. Pool full → evict oldest non-sticky IP
+	// ✅ Step 3: Pool full → evict oldest inactive entry within range
 	oldestIdx := -1
 	oldestTime := time.Now()
-	for i, r := range reservelist {
-		if r.Timestamp.Before(oldestTime) {
+	for i, r := range reserveList {
+		if r.Timestamp.Before(oldestTime) && ipnet.Contains(r.IP) &&
+			iphelpers.CompareIPs(r.IP, firstIP) >= 0 && iphelpers.CompareIPs(r.IP, lastIP) <= 0 {
 			oldestTime = r.Timestamp
 			oldestIdx = i
 		}
 	}
 
 	if oldestIdx >= 0 {
-		reservelist[oldestIdx].PodRef = podRef
-		reservelist[oldestIdx].IfName = ifName
-		reservelist[oldestIdx].ContainerID = containerID
-		reservelist[oldestIdx].Active = true
-		reservelist[oldestIdx].Timestamp = time.Now()
-		return net.IPNet{IP: reservelist[oldestIdx].IP, Mask: ipnet.Mask}, reservelist, nil
+		reserveList[oldestIdx].Active = true
+		reserveList[oldestIdx].PodRef = podRef
+		reserveList[oldestIdx].IfName = ifName
+		reserveList[oldestIdx].ContainerID = containerID
+		reserveList[oldestIdx].Timestamp = time.Now()
+		return reserveList[oldestIdx].IP, reserveList, nil
 	}
 
-	return net.IPNet{}, reservelist, fmt.Errorf("IP pool exhausted for sticky pool")
+	return net.IP{}, reserveList, fmt.Errorf("Sticky pool exhausted within range %s - %s", firstIP, lastIP)
 }
 
 // DeallocateIP removes allocation from reserve list. Returns the updated reserve list and the deallocated IP.
